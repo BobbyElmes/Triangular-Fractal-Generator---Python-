@@ -1,0 +1,12 @@
+[package]
+name = "polygon-fractal"
+version = "0.1.0"
+edition = "2021"
+description = "Interactive polygon edge-fractal generator"
+
+[dependencies]
+eframe = "0.31"
+tiny-skia = "0.11"
+rayon = "1"
+png = "0.17"
+rfd = "0.15"
