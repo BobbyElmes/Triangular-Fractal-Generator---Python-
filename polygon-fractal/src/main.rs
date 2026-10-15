@@ -1,18 +1,16 @@
-mod geom;
-mod render;
-
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Instant;
 
 use eframe::egui;
-use geom::{
-    arrange, equalize, generate, set_side_count, ArrangementParams, BgMode, ColourMode, FillMode,
-    FractalParams, Motif,
+use polygon_fractal::geom::{
+    self, arrange, equalize, generate, set_side_count, ArrangementParams, BgMode, ColourMode,
+    FillMode, FractalParams, Motif, MAX_DEPTH,
 };
-use render::{
+use polygon_fractal::render::{
     composite_arrangement, render_pixmap, straight_rgba, write_png, write_svg, StampCache,
+    MAX_STAMP_TIER,
 };
 
 fn main() -> eframe::Result<()> {
@@ -205,7 +203,8 @@ impl App {
         }
 
         ui.add(egui::Slider::new(&mut self.params.shrink, 0.05..=0.95).text("Shrink"));
-        ui.add(egui::Slider::new(&mut self.params.depth, 1..=12).text("Depth"));
+        ui.add(egui::Slider::new(&mut self.params.depth, 0..=MAX_DEPTH).text("Depth"))
+            .on_hover_text("0 draws only the seed polygon.");
         shrink_by_depth_controls(
             ui,
             self.params.shrink,
@@ -241,6 +240,8 @@ impl App {
             ui.selectable_value(&mut self.params.inward, false, "Outward");
             ui.selectable_value(&mut self.params.inward, true, "Inward");
         });
+        ui.checkbox(&mut self.params.outward_only, "Outward from center")
+            .on_hover_text("Only draw a shape when it grows away from the center.");
 
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.params.colour_mode, ColourMode::Single, "Single");
@@ -384,7 +385,7 @@ impl App {
             egui::Slider::new(&mut self.arrangement.gap, -geom::GAP_LIMIT..=geom::GAP_LIMIT)
                 .text("Gap"),
         );
-        ui.add(egui::Slider::new(&mut self.arrangement.depth, 0..=12).text("Depth"));
+        ui.add(egui::Slider::new(&mut self.arrangement.depth, 0..=MAX_DEPTH).text("Depth"));
         shrink_by_depth_controls(
             ui,
             self.arrangement.shrink,
@@ -403,6 +404,8 @@ impl App {
             ui.selectable_value(&mut self.arrangement.inward, false, "Outward");
             ui.selectable_value(&mut self.arrangement.inward, true, "Inward");
         });
+        ui.checkbox(&mut self.arrangement.outward_only, "Outward from center")
+            .on_hover_text("Only place a shape when it grows away from the center.");
         background_controls(
             ui,
             &mut self.arrangement.background,
@@ -918,7 +921,7 @@ fn export_worker(rx: Receiver<ExportRequest>, tx: Sender<ExportDone>) {
                     arrangement.bg_angle,
                     request.width,
                     request.height,
-                    4096,
+                    MAX_STAMP_TIER,
                     arrangement.glow,
                     arrangement.glow_radius,
                 )

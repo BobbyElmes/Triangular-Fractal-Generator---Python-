@@ -5,7 +5,7 @@
 
 use crate::geom::{
     fill_color, ArrangementOutput, BgMode, Bounds, FillMode, FractalParams, InstanceOutline, Motif,
-    Output, Segment, StampPlacement,
+    Output, Segment, StampPlacement, MAX_DEPTH,
 };
 use png::{BitDepth, ColorType, Encoder};
 use rayon::prelude::*;
@@ -23,6 +23,9 @@ const TILE: u32 = 512;
 const MARGIN: f32 = 0.04;
 const PATH_CHUNK: usize = 8_000;
 const MAX_GLOW_RADIUS: f32 = 64.0;
+/// Largest cached motif stamp. A placement drawn larger than this is upscaled.
+/// Matches the maximum canvas side so a full-frame root stamp stays sharp.
+pub const MAX_STAMP_TIER: u32 = 16_384;
 
 struct View {
     scale: f32,
@@ -613,9 +616,10 @@ fn stroke_tile(
     if segments.is_empty() {
         return;
     }
-    let mut by_depth: Vec<Vec<PxSeg>> = (0..13).map(|_| Vec::new()).collect();
+    let depth_slots = MAX_DEPTH as usize + 1;
+    let mut by_depth: Vec<Vec<PxSeg>> = (0..depth_slots).map(|_| Vec::new()).collect();
     for segment in segments {
-        let slot = (segment.depth as usize).min(12);
+        let slot = (segment.depth as usize).min(MAX_DEPTH as usize);
         by_depth[slot].push(PxSeg {
             x0: segment.x0 - origin_x,
             y0: segment.y0 - origin_y,
@@ -835,9 +839,11 @@ fn downsample(src: &Pixmap, size: u32) -> Option<Pixmap> {
 }
 
 fn stamp_tier(max_dest_px: f32, max_tier: u32) -> u32 {
-    let cap = max_tier.clamp(32, 4096);
+    let cap = max_tier.clamp(32, MAX_STAMP_TIER);
     let needed = (max_dest_px.ceil().max(1.0) as u32).clamp(1, cap);
-    needed.next_power_of_two().clamp(32, cap.next_power_of_two().min(4096))
+    needed
+        .next_power_of_two()
+        .clamp(32, cap.next_power_of_two().min(MAX_STAMP_TIER))
 }
 
 fn pick_tier(tiers: &[(u32, Pixmap)], dest: f32) -> usize {

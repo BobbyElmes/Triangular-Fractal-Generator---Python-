@@ -7,10 +7,15 @@
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
+/// Inclusive recursion cap. Shape fractals and arrangements both use 0..=MAX_DEPTH.
+/// Depth 0 draws only the seed polygon.
+pub const MAX_DEPTH: u32 = 16;
 /// Hard stop so a high side count and depth cannot allocate without bound.
-const MAX_SEGMENTS: usize = 1_500_000;
+/// About 0.5 GB of segment storage. Enough for two extra levels on squares
+/// and triangles, or one extra level on a dense heptagon, including symmetry copies.
+const MAX_SEGMENTS: usize = 16_000_000;
 /// Hard stop so an arrangement cannot blit without bound.
-const MAX_INSTANCES: usize = 4_096;
+const MAX_INSTANCES: usize = 32_768;
 /// Gap slider ends. At `-GAP_LIMIT` each layer sits on its parent.
 pub const GAP_LIMIT: f32 = 4.0;
 
@@ -136,9 +141,13 @@ pub struct FractalParams {
     pub shrink: f32,
     /// Empty uses `shrink` at every depth. Entry `d` is the factor for a child created at depth `d`.
     pub shrink_by_depth: Vec<f32>,
+    /// Recursion depth. 0 draws only the seed polygon.
     pub depth: u32,
     pub rotation_deg: f32,
     pub inward: bool,
+    /// When true, a child is drawn only if its body points away from the origin.
+    /// The seed polygon is always drawn.
+    pub outward_only: bool,
     pub twist_deg: f32,
     pub colour_mode: ColourMode,
     pub color_start: [u8; 3],
@@ -194,6 +203,7 @@ impl Default for FractalParams {
             depth: 6,
             rotation_deg: 0.0,
             inward: false,
+            outward_only: false,
             twist_deg: 0.0,
             colour_mode: ColourMode::Gradient,
             color_start: [255, 200, 0],
@@ -243,7 +253,7 @@ impl FractalParams {
             }
             *value = value.clamp(0.05, 0.95);
         }
-        params.depth = params.depth.clamp(1, 12);
+        params.depth = params.depth.clamp(0, MAX_DEPTH);
         if !params.rotation_deg.is_finite() {
             params.rotation_deg = 0.0;
         }
@@ -305,7 +315,7 @@ impl FractalParams {
         self.side_lengths = (0..sides).map(|_| rng.gen_range_f32(MIN_SIDE, 8.0)).collect();
         self.shrink = rng.gen_range_f32(0.05, 0.95);
         self.shrink_by_depth.clear();
-        self.depth = rng.gen_range_u32(1, 12);
+        self.depth = rng.gen_range_u32(0, MAX_DEPTH);
         self.rotation_deg = rng.gen_range_f32(-180.0, 180.0);
         self.twist_deg = rng.gen_range_f32(-180.0, 180.0);
         self.inward = rng.gen_bool();
@@ -355,6 +365,9 @@ pub struct ArrangementParams {
     pub depth: u32,
     pub rotation_deg: f32,
     pub inward: bool,
+    /// When true, a stamp is placed only if its body points away from the origin.
+    /// The root stamp is always placed.
+    pub outward_only: bool,
     pub twist_deg: f32,
     pub background: [u8; 3],
     /// Canvas fill. [`BgMode::Solid`] uses only `background`.
@@ -385,6 +398,7 @@ impl Default for ArrangementParams {
             depth: 2,
             rotation_deg: 0.0,
             inward: false,
+            outward_only: false,
             twist_deg: 0.0,
             background: [0, 0, 0],
             bg_mode: BgMode::Solid,
@@ -424,7 +438,7 @@ impl ArrangementParams {
             params.gap = 0.0;
         }
         params.gap = params.gap.clamp(-GAP_LIMIT, GAP_LIMIT);
-        params.depth = params.depth.clamp(0, 12);
+        params.depth = params.depth.clamp(0, MAX_DEPTH);
         if !params.rotation_deg.is_finite() {
             params.rotation_deg = 0.0;
         }
@@ -464,7 +478,7 @@ impl ArrangementParams {
         self.shrink = rng.gen_range_f32(0.05, 0.95);
         self.shrink_by_depth.clear();
         self.gap = rng.gen_range_f32(-GAP_LIMIT, GAP_LIMIT);
-        self.depth = rng.gen_range_u32(0, 12);
+        self.depth = rng.gen_range_u32(0, MAX_DEPTH);
         self.rotation_deg = rng.gen_range_f32(-180.0, 180.0);
         self.twist_deg = rng.gen_range_f32(-180.0, 180.0);
         self.inward = rng.gen_bool();
@@ -611,6 +625,51 @@ fn placement_for_edge(
     }
 }
 
+/// A child on `edge_start`–`edge_end`, or nothing when `outward_only` rejects it.
+///
+/// Rejection uses the placed body, including twist and arrangement gap. The body
+/// must travel away from the origin along the ray through its attachment point.
+fn child_job(
+    seed: &[Vec2],
+    scale: f32,
+    edge_start: Vec2,
+    edge_end: Vec2,
+    parent_centroid: Vec2,
+    inward: bool,
+    twist_rad: f32,
+    depth: u32,
+    outward_only: bool,
+    gap: f32,
+) -> Option<Job> {
+    let placement = placement_for_edge(
+        seed,
+        scale,
+        edge_start,
+        edge_end,
+        parent_centroid,
+        inward,
+        twist_rad,
+        depth,
+    );
+    if outward_only {
+        let center = centroid(&instance_vertices(seed, placement));
+        let shift = layer_shift(center, parent_centroid, gap);
+        if !grows_away_from_center(placement.joint + shift, center + shift) {
+            return None;
+        }
+    }
+    Some(Job { placement, depth })
+}
+
+/// `center` lies further from the origin than `joint`, along the ray from the origin through `joint`.
+fn grows_away_from_center(joint: Vec2, center: Vec2) -> bool {
+    let travel = center - joint;
+    if joint.dot(joint) <= 1e-12 || travel.dot(travel) <= 1e-12 {
+        return true;
+    }
+    travel.dot(joint) > 0.0
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Segment {
     pub x0: f32,
@@ -733,19 +792,20 @@ pub fn generate(params: &FractalParams, width: u32, height: u32) -> Output {
             if (end - start).length() < 1e-4 {
                 continue;
             }
-            jobs.push(Job {
-                placement: placement_for_edge(
-                    &seed.vertices,
-                    first_shrink,
-                    start,
-                    end,
-                    parent_centroid,
-                    params.inward,
-                    twist,
-                    1,
-                ),
-                depth: 1,
-            });
+            if let Some(job) = child_job(
+                &seed.vertices,
+                first_shrink,
+                start,
+                end,
+                parent_centroid,
+                params.inward,
+                twist,
+                1,
+                params.outward_only,
+                0.0,
+            ) {
+                jobs.push(job);
+            }
         }
 
         let parts: Vec<(Vec<Segment>, Vec<InstanceOutline>)> = jobs
@@ -839,22 +899,20 @@ pub fn arrange(params: &ArrangementParams, width: u32, height: u32) -> Arrangeme
             if (end - start).length() < 1e-4 {
                 continue;
             }
-            stack.push((
-                Job {
-                    placement: placement_for_edge(
-                        &seed.vertices,
-                        first_shrink,
-                        start,
-                        end,
-                        parent_centroid,
-                        params.inward,
-                        twist,
-                        1,
-                    ),
-                    depth: 1,
-                },
+            if let Some(job) = child_job(
+                &seed.vertices,
+                first_shrink,
+                start,
+                end,
                 parent_centroid,
-            ));
+                params.inward,
+                twist,
+                1,
+                params.outward_only,
+                params.gap,
+            ) {
+                stack.push((job, parent_centroid));
+            }
         }
         while let Some((job, parent_center)) = stack.pop() {
             if placements.len() >= MAX_INSTANCES {
@@ -894,22 +952,20 @@ pub fn arrange(params: &ArrangementParams, width: u32, height: u32) -> Arrangeme
                 if (end - start).length() < 1e-4 {
                     continue;
                 }
-                stack.push((
-                    Job {
-                        placement: placement_for_edge(
-                            &seed.vertices,
-                            next_scale,
-                            start,
-                            end,
-                            parent_centroid,
-                            params.inward,
-                            twist,
-                            job.depth + 1,
-                        ),
-                        depth: job.depth + 1,
-                    },
+                if let Some(child) = child_job(
+                    &seed.vertices,
+                    next_scale,
+                    start,
+                    end,
                     parent_centroid,
-                ));
+                    params.inward,
+                    twist,
+                    job.depth + 1,
+                    params.outward_only,
+                    params.gap,
+                ) {
+                    stack.push((child, parent_centroid));
+                }
             }
         }
     }
@@ -1233,19 +1289,20 @@ fn grow_tree(
             if (end - start).length() < 1e-4 {
                 continue;
             }
-            stack.push(Job {
-                placement: placement_for_edge(
-                    &seed.vertices,
-                    next_scale,
-                    start,
-                    end,
-                    parent_centroid,
-                    params.inward,
-                    twist,
-                    job.depth + 1,
-                ),
-                depth: job.depth + 1,
-            });
+            if let Some(child) = child_job(
+                &seed.vertices,
+                next_scale,
+                start,
+                end,
+                parent_centroid,
+                params.inward,
+                twist,
+                job.depth + 1,
+                params.outward_only,
+                0.0,
+            ) {
+                stack.push(child);
+            }
         }
     }
     (segments, outlines)
@@ -1817,6 +1874,94 @@ mod tests {
     }
 
     #[test]
+    fn outward_only_keeps_shapes_that_leave_the_center() {
+        assert!(grows_away_from_center(
+            Vec2::new(1.0, 0.0),
+            Vec2::new(2.0, 0.1)
+        ));
+        assert!(!grows_away_from_center(
+            Vec2::new(1.0, 0.0),
+            Vec2::new(0.2, 0.0)
+        ));
+        assert!(grows_away_from_center(Vec2::ZERO, Vec2::new(-1.0, 0.0)));
+        assert!(!FractalParams::default().outward_only);
+        assert!(!ArrangementParams::default().outward_only);
+
+        let mut params = FractalParams::default();
+        params.depth = 1;
+        params.shrink = 0.5;
+        params.corner_radius = 0.0;
+        params.outward_only = true;
+        let outward = generate(&params, 256, 256);
+        assert_eq!(outward.segments.iter().filter(|s| s.depth == 0).count(), 3);
+        assert_eq!(outward.segments.iter().filter(|s| s.depth == 1).count(), 9);
+
+        params.inward = true;
+        let inward = generate(&params, 256, 256);
+        assert!(inward.segments.iter().all(|segment| segment.depth == 0));
+
+        params.inward = false;
+        params.twist_deg = 180.0;
+        let flipped = generate(&params, 256, 256);
+        assert_eq!(flipped.segments.len(), 3);
+
+        params.outward_only = false;
+        let unfiltered = generate(&params, 256, 256);
+        assert!(unfiltered.segments.len() > flipped.segments.len());
+
+        params.depth = 2;
+        params.twist_deg = 60.0;
+        params.side_lengths = vec![1.0, 1.0, 1.0];
+        params.outward_only = false;
+        let full = generate(&params, 256, 256);
+        assert_eq!(full.segments.iter().filter(|s| s.depth == 2).count(), 18);
+        params.outward_only = true;
+        let filtered = generate(&params, 256, 256);
+        assert_eq!(filtered.segments.iter().filter(|s| s.depth == 0).count(), 3);
+        assert_eq!(filtered.segments.iter().filter(|s| s.depth == 1).count(), 9);
+        assert_eq!(filtered.segments.iter().filter(|s| s.depth == 2).count(), 0);
+
+        params.twist_deg = 0.0;
+        params.side_lengths = vec![0.4, 1.2, 2.4];
+        params.outward_only = false;
+        let irregular = generate(&params, 256, 256);
+        params.outward_only = true;
+        let trimmed = generate(&params, 256, 256);
+        assert_eq!(irregular.segments.iter().filter(|s| s.depth == 0).count(), 3);
+        assert_eq!(trimmed.segments.iter().filter(|s| s.depth == 0).count(), 3);
+        assert_eq!(trimmed.segments.iter().filter(|s| s.depth == 1).count(), 9);
+        assert!(trimmed.segments.iter().any(|segment| segment.depth == 2));
+        assert!(trimmed.segments.len() < irregular.segments.len());
+
+        let mut arrangement = ArrangementParams::default();
+        arrangement.depth = 1;
+        arrangement.shrink = 0.5;
+        arrangement.motif_by_depth = vec![4, 4];
+        arrangement.outward_only = true;
+        let placed = arrange(&arrangement, 256, 256);
+        assert_eq!(placed.placements.len(), 4);
+        assert!(placed.placements.iter().any(|placement| placement.depth == 0));
+
+        arrangement.depth = 2;
+        arrangement.twist_deg = 60.0;
+        arrangement.motif_by_depth = vec![4, 4, 4];
+        let folded = arrange(&arrangement, 256, 256);
+        assert_eq!(folded.placements.iter().filter(|p| p.depth == 0).count(), 1);
+        assert_eq!(folded.placements.iter().filter(|p| p.depth == 1).count(), 3);
+        assert_eq!(folded.placements.iter().filter(|p| p.depth == 2).count(), 0);
+
+        arrangement.twist_deg = 180.0;
+        let root_only = arrange(&arrangement, 256, 256);
+        assert_eq!(root_only.placements.len(), 1);
+        assert_eq!(root_only.placements[0].depth, 0);
+        assert_eq!(root_only.placements[0].motif_id, 4);
+
+        arrangement.outward_only = false;
+        let all = arrange(&arrangement, 256, 256);
+        assert!(all.placements.len() > 1);
+    }
+
+    #[test]
     fn non_root_does_not_grow_from_the_joint() {
         let mut params = FractalParams::default();
         params.depth = 2;
@@ -2027,6 +2172,21 @@ mod tests {
     }
 
     #[test]
+    fn depth_zero_draws_only_the_seed() {
+        let mut params = FractalParams::default();
+        params.depth = 0;
+        params.corner_radius = 0.0;
+        params.side_lengths = vec![1.0, 1.2, 0.8, 1.4];
+        assert_eq!(params.sanitized().depth, 0);
+
+        let output = generate(&params, 256, 256);
+        assert!(!output.truncated);
+        assert!(output.outlines.is_empty());
+        assert_eq!(output.segments.len(), params.side_lengths.len());
+        assert!(output.segments.iter().all(|segment| segment.depth == 0));
+    }
+
+    #[test]
     fn triangle_arrangement_counts_follow_the_edge_rule() {
         let mut params = ArrangementParams::default();
         params.depth = 2;
@@ -2190,7 +2350,7 @@ mod tests {
         assert_eq!(second, second.sanitized());
         assert_ne!(first, second);
         assert!((3..=16).contains(&first.side_lengths.len()));
-        assert!((1..=12).contains(&first.depth));
+        assert!((0..=MAX_DEPTH).contains(&first.depth));
         assert!(first.palette.len() >= 2);
         assert!((0.0..=1.0).contains(&first.stroke_opacity));
         assert!((0.0..=1.0).contains(&first.stroke_taper));
@@ -2400,7 +2560,7 @@ mod tests {
 
         let seed = close_seed(&[1.0, 1.3, 0.7, 1.1]);
         for shrink in [0.05_f32, 0.5, 0.95, 1.0] {
-            for depth in [0_u32, 1, 6, 12] {
+            for depth in [0_u32, 1, 6, MAX_DEPTH] {
                 assert_eq!(
                     conservative_reach(&seed, shrink, &[], depth),
                     legacy_reach(&seed, shrink, depth)
